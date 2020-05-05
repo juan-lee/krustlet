@@ -359,3 +359,236 @@ async fn test_wasi_provider() -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
+
+#[tokio::test]
+async fn test_ignite_provider() -> Result<(), Box<dyn std::error::Error>> {
+    let client = kube::Client::try_default().await?;
+
+    let nodes: Api<Node> = Api::all(client);
+
+    let node = nodes.get("krustlet-ignite").await?;
+
+    let node_status = node.status.expect("node reported no status");
+    assert_eq!(
+        node_status
+            .node_info
+            .expect("node reported no information")
+            .architecture,
+        "wasm-wasi",
+        "expected node to support the wasm-wasi architecture"
+    );
+
+    let node_meta = node.metadata.expect("node reported no metadata");
+    assert_eq!(
+        node_meta
+            .labels
+            .expect("node had no labels")
+            .get("kubernetes.io/arch")
+            .expect("node did not have kubernetes.io/arch label"),
+        "ignite"
+    );
+
+    let taints = node
+        .spec
+        .expect("node had no spec")
+        .taints
+        .expect("node had no taints");
+    let taint = taints
+        .iter()
+        .find(|t| t.key == "krustlet/arch")
+        .expect("did not find krustlet/arch taint");
+    // There is no "operator" field in the type for the crate for some reason,
+    // so we can't compare it here
+    assert_eq!(
+        taint,
+        &Taint {
+            effect: "NoExecute".to_owned(),
+            key: "krustlet/arch".to_owned(),
+            value: Some("ignite".to_owned()),
+            ..Default::default()
+        }
+    );
+
+    let client: kube::Client = nodes.into();
+    let secrets: Api<Secret> = Api::namespaced(client.clone(), "default");
+    secrets
+        .create(
+            &PostParams::default(),
+            &serde_json::from_value(json!({
+                "apiVersion": "v1",
+                "kind": "Secret",
+                "metadata": {
+                    "name": "hello-ignite-secret"
+                },
+                "stringData": {
+                    "myval": "a cool secret"
+                }
+            }))?,
+        )
+        .await?;
+
+    let config_maps: Api<ConfigMap> = Api::namespaced(client.clone(), "default");
+    config_maps
+        .create(
+            &PostParams::default(),
+            &serde_json::from_value(json!({
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": {
+                    "name": "hello-ignite-configmap"
+                },
+                "data": {
+                    "myval": "a cool configmap"
+                }
+            }))?,
+        )
+        .await?;
+    // Create a temp directory to use for the host path
+    let tempdir = tempfile::tempdir()?;
+    let pods: Api<Pod> = Api::namespaced(client.clone(), "default");
+    let p = serde_json::from_value(json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "name": "hello-ignite"
+        },
+        "spec": {
+            "containers": [
+                {
+                    "name": "hello-ignite",
+                    "image": "weaveworks/ignite-ubuntu:latest",
+                    "volumeMounts": [
+                        {
+                            "mountPath": "/foo",
+                            "name": "secret-test"
+                        },
+                        {
+                            "mountPath": "/bar",
+                            "name": "configmap-test"
+                        },
+                        {
+                            "mountPath": "/baz",
+                            "name": "hostpath-test"
+                        }
+                    ]
+                },
+            ],
+            "tolerations": [
+                {
+                    "effect": "NoExecute",
+                    "key": "krustlet/arch",
+                    "operator": "Equal",
+                    "value": "ignite"
+                },
+            ],
+            "volumes": [
+                {
+                    "name": "secret-test",
+                    "secret": {
+                        "secretName": "hello-ignite-secret"
+                    }
+                },
+                {
+                    "name": "configmap-test",
+                    "configMap": {
+                        "name": "hello-ignite-configmap"
+                    }
+                },
+                {
+                    "name": "hostpath-test",
+                    "hostPath": {
+                        "path": tempdir.path()
+                    }
+                }
+            ]
+        }
+    }))?;
+
+    // TODO: Create a testing module to write to the path to actually check that writing and reading
+    // from a host path volume works
+
+    let pod = pods.create(&PostParams::default(), &p).await?;
+
+    assert_eq!(pod.status.unwrap().phase.unwrap(), "Pending");
+
+    let api = Api::namespaced(client.clone(), "default");
+    let inf: Informer<Pod> = Informer::new(api).params(
+        ListParams::default()
+            .fields("metadata.name=hello-ignite")
+            .timeout(30),
+    );
+
+    let mut watcher = inf.poll().await?.boxed();
+    let mut went_ready = false;
+    while let Some(event) = watcher.try_next().await? {
+        match event {
+            WatchEvent::Modified(o) => {
+                let phase = o.status.unwrap().phase.unwrap();
+                if phase == "Running" {
+                    went_ready = true;
+                }
+                if phase == "Succeeded" && !went_ready {
+                    panic!("Reached completed phase before receiving Running phase")
+                } else if phase == "Succeeded" {
+                    break;
+                }
+            }
+            WatchEvent::Error(e) => {
+                panic!("WatchEvent error: {:?}", e);
+            }
+            _ => {}
+        }
+    }
+
+    assert!(went_ready, "pod never went ready");
+
+    // TODO(juan-lee): re-enable once log is implemented
+    // let mut logs = pods
+    //     .log_stream("hello-ignite", &LogParams::default())
+    //     .await?;
+
+    // while let Some(line) = logs.try_next().await? {
+    //     assert_eq!("Hello, world!\n", String::from_utf8_lossy(&line));
+    // }
+
+    // let pod = pods.get("hello-ignite").await?;
+
+    // let state = (|| {
+    //     pod.status?.container_statuses?[0]
+    //         .state
+    //         .as_ref()?
+    //         .terminated
+    //         .clone()
+    // })()
+    // .expect("Could not fetch terminated states");
+    // assert_eq!(state.exit_code, 0);
+
+    // // TODO: Create a module that actually reads from a directory and outputs to logs
+    // let file_path_base = dirs::home_dir()
+    //     .expect("home dir does not exist")
+    //     .join(".krustlet/volumes/hello-ignite-default");
+    // let secret_file_bytes = tokio::fs::read(file_path_base.join("secret-test/myval"))
+    //     .await
+    //     .expect("unable to open secret file");
+    // let configmap_file_bytes = tokio::fs::read(file_path_base.join("configmap-test/myval"))
+    //     .await
+    //     .expect("unable to open configmap file");
+    // assert_eq!("a cool secret".to_owned().into_bytes(), secret_file_bytes);
+    // assert_eq!(
+    //     "a cool configmap".to_owned().into_bytes(),
+    //     configmap_file_bytes
+    // );
+
+    // cleanup
+    // TODO: Find an actual way to perform cleanup automatically, even in the case of failures
+    pods.delete("hello-ignite", &DeleteParams::default())
+        .await?;
+    secrets
+        .delete("hello-ignite-secret", &DeleteParams::default())
+        .await?;
+    config_maps
+        .delete("hello-ignite-configmap", &DeleteParams::default())
+        .await?;
+
+    Ok(())
+}

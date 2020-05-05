@@ -1,0 +1,22 @@
+[package]
+name = "ignite-provider"
+version = "0.1.0"
+authors = ["Juan-Lee Pang <jpang@microsoft.com>"]
+edition = "2018"
+
+[dependencies]
+anyhow = "1.0"
+async-trait = "0.1"
+kube = "0.33" 
+log = "0.4"
+tempfile = "3.1"
+kubelet = { path = "../kubelet", version = "0.1.0" }
+wat = "1.0"
+tokio = { version = "0.2", features = ["fs", "stream", "macros", "io-util", "sync"] }
+chrono = { version = "0.4", features = ["serde"] }
+futures = "0.3"
+k8s-openapi = { version = "0.7", features = ["v1_17"] }
+
+[dev-dependencies]
+oci-distribution = { path = "../oci-distribution", version = "0.1.0" }
+

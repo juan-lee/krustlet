@@ -1,4 +1,4 @@
-export RUST_LOG := "wascc_host=debug,wascc_provider=debug,wasi_provider=debug,main=debug"
+export RUST_LOG := "wascc_host=debug,wascc_provider=debug,wasi_provider=debug,ignite_provider=debug,main=debug"
 export PFX_PASSWORD := "testing"
 export KEY_DIR := env_var_or_default('KEY_DIR', '$HOME/.krustlet/config')
 
@@ -21,6 +21,9 @@ run-wascc: _cleanup_kube bootstrap-ssl
 
 run-wasi: _cleanup_kube bootstrap-ssl
     cargo run --bin krustlet-wasi -- --node-name krustlet-wasi --port 3001
+
+run-ignite: _cleanup_kube bootstrap-ssl
+    cargo run --bin krustlet-ignite -- --node-name krustlet-ignite --port 3002
 
 bootstrap-ssl:
     @# This is to get around an issue with the default function returning a string that gets escaped
